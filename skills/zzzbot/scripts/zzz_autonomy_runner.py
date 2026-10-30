@@ -883,22 +883,18 @@ def _parse_output(text: str, room):
     return {key: value if key == "tags" else value.strip() for key, value in result.items()}
 
 
-# ODIN's seat in rooms (data L32206, context L32211): on the one box the app names (ODIN_SEAT_TENANT, app side only),
-# its context reply carries `seat_answer`, either {"text": "..."} (the god box's answer, already framed "ODIN says: ...")
-# or null. The runner then makes no model call: it completes the turn with that text as the body, exactly as given,
-# or silent. Any other value completes silent and the run then fails with SEAT_ANSWER_CODE, so malformed text is never
-# posted and the code alone reaches stderr. Every other box's reply has no such key and takes the model path unchanged.
+# ODIN's seat in rooms (data L32206, context L32211): on the app's ODIN_SEAT_TENANT box the context carries
+# `seat_answer`, {"text": "..."} (already framed "ODIN says: ...") or null: no model call, the text posted exactly as
+# given, or silent. Anything else completes silent and fails SEAT_ANSWER_CODE. Other boxes never get the key.
 SEAT_ANSWER_CHARS = 2000
 SEAT_ANSWER_CODE = "seat-answer-shape"
-# ZZZ refuses a body-only complete for a new_topic (it needs a title or an existing_thread_id), so a seat text on a
-# new_topic candidate completes silent and the run fails with this code (review-b ov#554 N4).
+# ZZZ refuses a body-only new_topic complete, so a seat text there completes silent with this code (ov#554 N4).
 SEAT_TOPIC_CODE = "seat-answer-topic"
 
 
 def _seat_output(answer):
-    """The complete call's output for the app's seat_answer and the failure code after it (None when well formed):
-    ({"body": text}, None) for {"text": 1-2000 code points, not blank, no NUL, valid UTF-8}; ({"silent": True}, None)
-    for null; ({"silent": True}, SEAT_ANSWER_CODE) for anything else. The text is never changed, trimmed or logged."""
+    """(output, code): {"body": text} for {"text": 1-2000 code points, not blank, no NUL, valid UTF-8}, silent for null,
+    else silent and SEAT_ANSWER_CODE. The text is never changed, trimmed or logged."""
     if answer is None:
         return {"silent": True}, None
     text = answer.get("text") if isinstance(answer, dict) and set(answer) == {"text"} else None
@@ -919,6 +915,7 @@ AGENT_SECONDS, AGENT_MIN_SECONDS = 60, 20
 AGENT_TOOLSET = "zzz-autonomy-read"
 AGENT_TOOLS = ["skills_list", "skill_view", "ask_odin"]
 OWNER_CHARS, LEAK_CHARS = 1000, 24
+QUOTE_CHARS = 120  # one quote of the replied-to post (lead ruling, ov#580): it is public there; ~one sentence
 # av-events _user_md_gate.PRIVATE_ENTRY_MARKS (a test holds them equal)
 PRIVATE_MARKS = ("[Edge City profile, written at setup]",
                  "[God Constitution conversation, kept by the Agent Village control plane]")
@@ -1041,7 +1038,9 @@ def _agent_turn(scheduler, job_id: str, extra: str, seconds: float):
 
 
 def _fold(text: str) -> str:
-    return " ".join(text.split()).casefold()
+    """Both sides alike: BRIEF_STRIP_CATEGORIES characters (white space kept) dropped, NFKC, white space and case."""
+    text = "".join(c for c in text if c.isspace() or unicodedata.category(c) not in BRIEF_STRIP_CATEGORIES)
+    return " ".join(unicodedata.normalize("NFKC", text).split()).casefold()
 
 
 def _strings(value) -> list:
@@ -1053,8 +1052,10 @@ def _strings(value) -> list:
 
 def _leak(home: Path, output: dict, data) -> str:
     """agent-leak: the body or title holds a 24+ character line of MEMORY.md or USER.md (or one is unreadable);
-    agent-echo: it repeats 24 characters of room text. Folded, in memory, never logged."""
-    said = [_fold(output[key]) for key in ("body", "title") if key in output]
+    agent-echo: 24 characters of room text, bar ONE quote of source.body <= QUOTE_CHARS; agent-format: an invisible
+    character but newline or tab. Folded, in memory, never logged."""
+    raw = [output[key] for key in ("body", "title") if key in output]
+    said = [_fold(text) for text in raw]
     for name in ("MEMORY.md", "USER.md"):
         try:
             fd = os.open(home / "memories" / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -1066,9 +1067,20 @@ def _leak(home: Path, output: dict, data) -> str:
             lines = [_fold(line) for line in source.read(1 << 22).decode("utf-8", "replace").split("\n")]
         if any(len(line) >= LEAK_CHARS and line in text for line in lines for text in said):
             return "agent-leak"
-    room = "\0".join(_fold(text) for text in _strings(data))
-    return "agent-echo" if any(text[i:i + LEAK_CHARS] in room for text in said
-                               for i in range(len(text) - LEAK_CHARS + 1)) else ""
+    source = _fold(data["source"]["body"]) if "source" in data else "\1"
+    room, quoted = "\0".join(_fold(text) for text in _strings({**data, "source": ""})), set()
+    for n, text in enumerate(said):
+        for i in range(len(text) - LEAK_CHARS + 1):
+            if text[i:i + LEAK_CHARS] in source:
+                quoted.update((n, j) for j in range(i, i + LEAK_CHARS))
+            elif text[i:i + LEAK_CHARS] in room:
+                return "agent-echo"
+    spans = sorted(quoted)  # one quote = one contiguous run
+    runs = sum(k == 0 or spans[k] != (spans[k - 1][0], spans[k - 1][1] + 1) for k in range(len(spans)))
+    if runs > 1 or len(spans) > QUOTE_CHARS:
+        return "agent-echo"
+    return "agent-format" if any(c not in "\n\t" and unicodedata.category(c) in BRIEF_STRIP_CATEGORIES
+                                 for text in raw for c in text) else ""
 
 
 def _agent_output(context: dict, home: Path, scheduler, job_id: str):
@@ -1108,14 +1120,9 @@ def _utc_day(now: float) -> str:
 
 
 def _state_read(home: Path, now: float) -> dict:
-    """The runner's own state: {failures, until, day, turns[, code]}, always normalized and in range.
-
-    Missing: a clean state. Not a regular file (a FIFO, a socket, a symlink): refused before any claim, so no spend.
-    Oversized, unparsable or out of range values never disable a guard and never hang: a bad failure count or
-    "until" (negative, not an int, NaN, Infinity, beyond the cap) reads as no backoff now with the next failure
-    backing off; a bad day or turn count reads as today's cap reached (no model call today, reset tomorrow).
-    Only an earlier stored day resets the count; a future one (a clock stepped back) is a bad day, so the cap holds.
-    """
+    """{failures, until, day, turns[, code]}, normalized. Missing: clean. Not a regular file: refused before any
+    claim. Bad values never disable a guard: a bad failure count or "until" = no backoff now, the next failure backs
+    off; a bad day or turn count = today's cap reached. Only an earlier day resets the count (a future one is bad)."""
     today = _utc_day(now)
     directory = _state_dir(home)
     try:
