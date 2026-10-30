@@ -626,6 +626,44 @@ class TestSecurityFold(FullAgentBase):
         _, completes, _ = self.turn(room, FakeScheduler(text=json.dumps(fine)))
         self.assertEqual(completes, [fine])
 
+    def test_source_fields_other_than_the_body_stay_in_the_echo_corpus(self):
+        """Only source.body has the one-quote allowance; the source's title (or any other source text) is room text."""
+        title = "Weekly hardware sync for the water filter team"
+        room = {"kind": "reply", "agent_turn": True, "source": {"body": "Who is building a water filter?",
+                                                                "title": title, "author_label": "Asha K"}}
+        _, completes, _ = self.turn(room, FakeScheduler(text=json.dumps({"body": f"Re: {title.upper()}!"})),
+                                    output={"silent": True})
+        self.assertEqual(completes, [{"silent": True}])
+        self.assertIn("agent-echo", self.notes)
+        quote = {"body": 'You asked "Who is building a water filter?" and I am.'}
+        _, completes, _ = self.turn(room, FakeScheduler(text=json.dumps(quote)))
+        self.assertEqual(completes, [quote])
+        for absent in ({"kind": "new_topic", "candidate_id": "x", "room_brief": "B", "recent_topics": []},):
+            self.assertEqual(runner._leak(self.home, {"body": "Anything new to say here today, friends?", "title": "T"},
+                                          runner._room(absent)[1]), "")
+
+    def test_default_ignorable_characters_are_one_predicate(self):
+        """_fold drops and agent-format refuses the same set: BRIEF_STRIP_CATEGORIES plus HIDDEN (variation selectors,
+        CGJ, Hangul fillers, braille blank, Mongolian FVS, Khmer inherent vowels)."""
+        private = "Lives at 14 Calle Mayor and is between jobs since March."
+        (self.home / "memories").mkdir()
+        (self.home / "memories/MEMORY.md").write_text(f"Likes sensors.\n{private}\n")
+        split = lambda text, mark: mark.join(text[i:i + 3] for i in range(0, len(text), 3))  # noqa: E731
+        marks = ("\ufe0f", "\U000e0100", "\u034f", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800", "\u180b",
+                 "\u17b4")
+        for mark in marks:
+            with self.subTest(mark=hex(ord(mark))):
+                self.assertTrue(runner._hidden(mark))
+                self.assertEqual(runner._fold(split(private, mark)), runner._fold(private))
+                for body, code in ((split(private, mark), "agent-leak"),
+                                   (f"Happy to pair{mark} on the enclosure.", "agent-format")):
+                    _, completes, _ = self.turn({**ROOMS[0], "agent_turn": True},
+                                                FakeScheduler(text=json.dumps({"body": body})), output={"silent": True})
+                    self.assertEqual(completes, [{"silent": True}])
+                    self.assertIn(code, self.notes)
+        for kept in ("\n", "\t", " ", "a", "\u00e9"):
+            self.assertFalse(runner._hidden(kept) and kept not in "\n\t")
+
     def test_private_marks_match_the_gate(self):
         self.assertEqual(runner.PRIVATE_MARKS, gate.PRIVATE_ENTRY_MARKS)
 
