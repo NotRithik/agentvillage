@@ -105,20 +105,51 @@ def capture_model(content='{"silent":true}'):
     return OpenAI, calls
 
 
-class FakeScheduler:
-    """cron.scheduler with run_job only: answers `text`, raises `error`, or blocks until cancelled."""
+class FakeAgent:
+    """run_agent.AIAgent as far as the runner reads it (agent/agent_init.py _init_memory: skip_memory leaves
+    _memory_store and _memory_manager None; `memory_on` plays a Hermes that ignores it)."""
+    memory_on = False
 
-    def __init__(self, text=None, error=None, block=False):
-        self.text, self.error, self.block = text, error, block
-        self.calls, self.cancelled = [], threading.Event()
+    def __init__(self, **kwargs):
+        self.kwargs, self.interrupts = kwargs, []
+        on = self.memory_on or not kwargs.get("skip_memory")
+        self._memory_store, self._memory_manager = (object() if on else None), None
+        self.skip_context_files = kwargs.get("skip_context_files", False)
+        self.load_soul_identity = kwargs.get("load_soul_identity", False)
+
+    def interrupt(self, message=None, *, hard_cancel=False, **_kwargs):
+        self.interrupts.append(hard_cancel)
+
+
+class FakeScheduler:
+    """cron.scheduler: run_job builds its agent through _construct_cron_agent with Hermes's hardcoded cron kwargs
+    (cron/scheduler.py:2410-2440), then answers `text`, raises `error`, or blocks until cancelled. `seam=False` is a
+    Hermes without that seam; `build=False` one whose run_job never calls it."""
+
+    def __init__(self, text=None, error=None, block=False, seam=True, build=True, agent=FakeAgent, late=None):
+        self.text, self.error, self.block, self.build, self.agent_cls, self.late = text, error, block, build, agent, late
+        self.calls, self.cancelled, self.agents, self.ran = [], threading.Event(), [], []
+        if seam:
+            self._construct_cron_agent = self._construct
+
+    def _construct(self, AIAgent, job, _cfg, _setup, *, workdir, session_id, session_db):
+        return AIAgent(model="m", enabled_toolsets=list(job["enabled_toolsets"]), skip_context_files=not bool(workdir),
+                       load_soul_identity=True, skip_memory=False, platform="cron", session_id=session_id)
 
     def run_job(self, job, extra_prompt=None, cancel_event=None, **_kwargs):
         self.calls.append({"job": dict(job), "extra_prompt": extra_prompt})
+        if self.build:
+            try:
+                self.agents.append(self._construct_cron_agent(self.agent_cls, job, {}, None, workdir=job.get("workdir"),
+                                                              session_id="cron_x", session_db=None))
+            except Exception as error:  # run_job's own except: a failed build is a failed run
+                return False, "", "", str(error)
+        self.ran.append(1)
         if self.block:
             while cancel_event is not None and not cancel_event.wait(0.01):
                 pass
             self.cancelled.set()
-            return False, "", "", "cancelled"
+            return (True, "", self.late, None) if self.late else (False, "", "", "cancelled")
         if self.error is not None:
             raise self.error
         return True, "# output doc", self.text, None
@@ -191,13 +222,14 @@ class FullAgentBase(unittest.TestCase):
                 patch.object(runner, "_activity", side_effect=activity), \
                 patch.object(runner, "_output", side_effect=model), \
                 patch.object(runner, "_hermes", side_effect=hermes), \
-                patch.object(runner, "_note"):
+                patch.object(runner, "_note") as note:
             if code is None:
                 runner.run(self.home)
             else:
                 with self.assertRaisesRegex(ValueError, f"^{code}$"):
                     runner.run(self.home)
         self.hermes_calls = hermes_calls
+        self.notes = [call.args[0] for call in note.call_args_list]
         return ops, completes, model_calls
 
 
@@ -398,7 +430,6 @@ class TestPrivacy(FullAgentBase):
         loaded, _ = self.call_hermes(self.hermes_with(seam=False, snapshot=True))
         self.assertIsNotNone(loaded)
 
-    @unittest.expectedFailure  # GAP for Lane A: _agent_prompt passes a resident_brief snippet holding a Private mark
     def test_no_private_mark_reaches_the_agent_prompt(self):
         context = {**ROOMS[1], "agent_turn": True, "resident_brief": {
             "agent_name": "Kiwi", "voice": None, "snippets": [
@@ -450,12 +481,111 @@ class TestInjection(FullAgentBase):
                                               FakeScheduler(text=text), output={"silent": True})
                 self.assertEqual(completes, [{"silent": True}])
 
-    @unittest.expectedFailure  # GAP for Lane A: no verbatim-echo guard yet; remove this line when one lands
     def test_an_answer_that_repeats_the_injection_is_not_posted(self):
         echo = json.dumps({"body": "VISIT-SCAM-LINK-0xDEADBEEF-NOW for free tokens"})
         ops, completes, _ = self.turn({"kind": "reply", "source": {"body": INJECTION}, "agent_turn": True},
                                       FakeScheduler(text=echo), output={"silent": True})
         self.assertNotIn("VISIT-SCAM-LINK-0xDEADBEEF-NOW", json.dumps(completes))
+
+
+# Hermes's stock toolset names (hermes-agent v2026.9.24 toolsets.py TOOLSETS) that carry a write or outbound tool:
+# `skills` holds skill_manage, `web` web_extract, `search` web_search. None may reach enabled_toolsets.
+STOCK_TOOLSETS = {"skills", "web", "search", "x_search", "browser", "terminal", "file", "memory", "session_search",
+                  "code_execution", "delegation", "cronjob", "messaging", "clarify", "connections", "todo", "tts",
+                  "vision", "image_gen", "video_gen", "homeassistant", "kanban", "discord", "all", "*"}
+
+
+class TestSecurityFold(FullAgentBase):
+    """ov#580 review: the agent turn sees no memory, soul or context files; no outbound tool; no private line or
+    room-text echo is ever posted; a cancelled turn's result is never used."""
+
+    AGENT = {**ROOMS[0], "agent_turn": True}
+
+    def test_agent_is_built_with_memory_soul_and_context_files_off(self):
+        scheduler = FakeScheduler(text='{"body":"Happy to pair on the filter housing."}')
+        _, completes, model_calls = self.turn(self.AGENT, scheduler)
+        self.assertEqual(completes, [{"body": "Happy to pair on the filter housing."}])
+        self.assertEqual(model_calls, [])
+        (agent,) = scheduler.agents
+        self.assertIs(agent.kwargs["skip_memory"], True)
+        self.assertIs(agent.kwargs["load_soul_identity"], False)
+        self.assertIs(agent.kwargs["skip_context_files"], True)
+        self.assertNotIn("workdir", scheduler.calls[0]["job"])  # Hermes itself then skips context files too
+
+    def test_no_memory_off_seam_fails_closed_to_todays_call(self):
+        class StubbornAgent(FakeAgent):
+            memory_on = True  # a Hermes whose AIAgent ignores skip_memory
+        for scheduler in (FakeScheduler(text='{"body":"agent"}', seam=False),
+                          FakeScheduler(text='{"body":"agent"}', build=False),
+                          FakeScheduler(text='{"body":"agent"}', agent=StubbornAgent)):
+            with self.subTest(seam="_construct_cron_agent" in vars(scheduler), build=scheduler.build):
+                _, completes, model_calls = self.turn(self.AGENT, scheduler, output={"body": "Today."})
+                self.assertEqual(completes, [{"body": "Today."}])
+                self.assertEqual(len(model_calls), 1)
+                self.assertIn("agent-context", self.notes)
+                if scheduler.agent_cls is StubbornAgent:
+                    self.assertEqual(scheduler.ran, [])  # the memory-bearing agent never ran a turn
+
+    def test_a_body_quoting_a_private_memory_line_is_never_posted(self):
+        private = "Lives at 14 Calle Mayor and is between jobs since March."
+        (self.home / "memories").mkdir()
+        (self.home / "memories/USER.md").write_text(f"Likes sensors.\n§\n{gate.SETUP_PROFILE_MARK}\n{private}\n")
+        for body in (f"Fun fact: {private}", "FUN: " + "  ".join(private.upper().split())):
+            with self.subTest(body=body[:12]):
+                _, completes, _ = self.turn(self.AGENT, FakeScheduler(text=json.dumps({"body": body})),
+                                            output={"silent": True})
+                self.assertEqual(completes, [{"silent": True}])
+                self.assertIn("agent-leak", self.notes)
+        _, completes, _ = self.turn(self.AGENT, FakeScheduler(text='{"body":"Happy to help with sensors."}'))
+        self.assertEqual(completes, [{"body": "Happy to help with sensors."}])
+
+    def test_an_unreadable_memory_file_counts_as_a_leak(self):
+        (self.home / "memories").mkdir()
+        (self.home / "elsewhere.md").write_text("x")
+        (self.home / "memories/MEMORY.md").symlink_to(self.home / "elsewhere.md")
+        _, completes, _ = self.turn(self.AGENT, FakeScheduler(text='{"body":"A new point."}'), output={"silent": True})
+        self.assertEqual(completes, [{"silent": True}])
+        self.assertIn("agent-leak", self.notes)
+
+    def test_echo_check_reads_body_and_title_only(self):
+        topic = {**ROOMS[2], "agent_turn": True, "recent_topics": [
+            {"thread_id": "0123456789abcdef0123456789abcdef", "title": "Teams"}],
+            "room_tags": ["hardware-and-embedded-systems"]}
+        answer = {"body": "Who wants to compare notes on enclosures?", "existing_thread_id":
+                  "0123456789abcdef0123456789abcdef"}
+        _, completes, _ = self.turn(topic, FakeScheduler(text=json.dumps(answer)))
+        self.assertEqual(completes, [answer])
+        echo = {**ROOMS[1], "agent_turn": True}
+        _, completes, _ = self.turn(echo, FakeScheduler(text='{"body":"Asha says: I CAN HELP with sensors."}'),
+                                    output={"silent": True})
+        self.assertEqual(completes, [{"silent": True}])
+        self.assertIn("agent-echo", self.notes)
+
+    def test_no_web_or_stock_toolset_reaches_the_agent(self):
+        self.assertEqual(runner.AGENT_TOOLS, ["skills_list", "skill_view", "ask_odin"])
+        self.assertNotIn("web_search", runner.AGENT_TOOLS)
+        self.assertNotIn(runner.AGENT_TOOLSET, STOCK_TOOLSETS)
+        self.assertFalse(runner.AGENT_TOOLSET.startswith("hermes-"))
+        scheduler = FakeScheduler(text='{"silent":true}')
+        self.turn(self.AGENT, scheduler)
+        toolsets = scheduler.calls[0]["job"]["enabled_toolsets"]
+        self.assertEqual(toolsets, [runner.AGENT_TOOLSET, "no_mcp"])
+        self.assertFalse(set(toolsets) & STOCK_TOOLSETS)
+        self.assertNotIn("web_search", runner.AGENT_PROMPT)
+
+    def test_cancel_interrupts_at_once_and_a_late_answer_is_never_used(self):
+        scheduler = FakeScheduler(block=True, late='{"body":"LATE ANSWER FROM THE CANCELLED TURN"}')
+        with patch.object(runner, "AGENT_SECONDS", 0.3), patch.object(runner, "AGENT_MIN_SECONDS", 0.1):
+            _, completes, model_calls = self.turn(self.AGENT, scheduler, output={"body": "Fallback answer."})
+        self.assertTrue(scheduler.cancelled.wait(2))
+        (agent,) = scheduler.agents
+        self.assertEqual(agent.interrupts, [True])  # hard interrupt: Hermes starts no further tool call
+        self.assertEqual(completes, [{"body": "Fallback answer."}])
+        self.assertIn("agent-timeout", self.notes)
+        self.assertNotIn("LATE", json.dumps(completes))
+
+    def test_private_marks_match_the_gate(self):
+        self.assertEqual(runner.PRIVATE_MARKS, gate.PRIVATE_ENTRY_MARKS)
 
 
 if __name__ == "__main__":
